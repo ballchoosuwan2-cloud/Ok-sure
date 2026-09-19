@@ -7,14 +7,18 @@ interface CameraScannerModalProps {
   isOpen: boolean;
   onClose: () => void;
   onScanSuccess: (decodedText: string) => void;
-  availableProducts: Product[];
+  availableProducts?: Product[];
+  title?: string;
+  subtitle?: string;
 }
 
 export const CameraScannerModal: React.FC<CameraScannerModalProps> = ({
   isOpen,
   onClose,
   onScanSuccess,
-  availableProducts,
+  availableProducts = [],
+  title = 'สแกนบาร์โค้ด / QR Code',
+  subtitle,
 }) => {
   const [cameraError, setCameraError] = useState<string | null>(null);
   const [isScanning, setIsScanning] = useState(false);
@@ -113,7 +117,10 @@ export const CameraScannerModal: React.FC<CameraScannerModalProps> = ({
         <div className="bg-slate-900 text-white px-5 py-3.5 flex items-center justify-between">
           <div className="flex items-center gap-2">
             <Camera className="w-5 h-5 text-emerald-400" />
-            <h3 className="font-semibold text-base">สแกนบาร์โค้ด / QR Code</h3>
+            <div>
+              <h3 className="font-semibold text-base leading-tight">{title}</h3>
+              {subtitle && <p className="text-[11px] text-slate-400 leading-tight mt-0.5">{subtitle}</p>}
+            </div>
           </div>
           <button
             onClick={onClose}

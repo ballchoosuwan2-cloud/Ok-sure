@@ -1,4 +1,4 @@
-import React, { createContext, useContext, useState, useEffect, ReactNode, useMemo } from 'react';
+import React, { createContext, useContext, useState, useEffect, ReactNode, useMemo, useRef } from 'react';
 import {
   Product,
   CartItem,
@@ -25,6 +25,27 @@ import {
 } from '../utils/initialData';
 import { announceQueueNumber } from '../utils/audioQueue';
 import { saveSecureData } from '../utils/storageDB';
+import {
+  db,
+  ensureTerminalAuth,
+  formatProductForFirestore,
+  deductProductStockInFirestore,
+  processAtomicCheckoutInFirestore,
+  testFirestoreConnection,
+} from '../firebase';
+import {
+  collection,
+  doc,
+  setDoc,
+  updateDoc,
+  deleteDoc,
+  onSnapshot,
+  getDocs,
+  writeBatch,
+  query,
+  orderBy,
+  limit,
+} from 'firebase/firestore';
 
 export interface HeldBill {
   id: string;
@@ -35,7 +56,7 @@ export interface HeldBill {
   cashierName: string;
 }
 
-interface POSContextType {
+export interface POSContextType {
   products: Product[];
   cart: CartItem[];
   overallDiscount: number;
@@ -51,6 +72,12 @@ interface POSContextType {
   activityLogs: ActivityLog[];
   todayDateStr: string;
   isTodayClosed: boolean;
+
+  // Real-time Cloud Database Status
+  isOnline: boolean;
+  syncStatus: 'synced' | 'syncing' | 'offline' | 'error';
+  lastSyncedAt: string | null;
+  syncError: string | null;
 
   // Cart actions
   addToCart: (product: Product, quantity?: number) => void;
@@ -69,7 +96,7 @@ interface POSContextType {
     cashReceived?: number,
     splitDetails?: SplitPaymentDetail,
     customerName?: string
-  ) => { transaction: BillTransaction; queue: QueueItem };
+  ) => Promise<{ transaction: BillTransaction; queue: QueueItem }>;
   refundTransaction: (transactionId: string, reason: string) => boolean;
 
   // Inventory actions
@@ -116,162 +143,427 @@ const STORAGE_KEYS = {
   LOGS: 'pos_activity_logs_v2',
 };
 
-// ตรวจสอบสถานะเปิดร้านจริง (ครั้งแรกที่เปิดระบบ ทำการล้างข้อมูลจำลองเดิมออกเพื่อเริ่มระบบเปล่าของร้านโอเค ชัวร์)
-try {
-  const REAL_CLEAN_KEY = 'ok_sure_real_clean_v1';
-  if (typeof window !== 'undefined' && localStorage.getItem(REAL_CLEAN_KEY) !== 'true') {
-    localStorage.removeItem(STORAGE_KEYS.PRODUCTS);
-    localStorage.removeItem(STORAGE_KEYS.TRANSACTIONS);
-    localStorage.removeItem(STORAGE_KEYS.QUEUES);
-    localStorage.removeItem(STORAGE_KEYS.MOVEMENTS);
-    localStorage.removeItem(STORAGE_KEYS.CLOSINGS);
-    localStorage.removeItem(STORAGE_KEYS.HELD_BILLS);
-    localStorage.setItem(STORAGE_KEYS.PRODUCTS, JSON.stringify([]));
-    localStorage.setItem(STORAGE_KEYS.TRANSACTIONS, JSON.stringify([]));
-    localStorage.setItem(STORAGE_KEYS.QUEUES, JSON.stringify([]));
-    localStorage.setItem(STORAGE_KEYS.MOVEMENTS, JSON.stringify([]));
-    localStorage.setItem(STORAGE_KEYS.CLOSINGS, JSON.stringify([]));
-    localStorage.setItem(STORAGE_KEYS.HELD_BILLS, JSON.stringify([]));
-    localStorage.setItem(REAL_CLEAN_KEY, 'true');
-  }
-} catch (e) {
-  console.warn('Storage init check:', e);
-}
-
 export const POSProvider: React.FC<{ children: ReactNode }> = ({ children }) => {
   const todayDateStr = useMemo(() => new Date().toISOString().split('T')[0], []);
 
-  // Products state
+  // Online / Offline & Real-time Cloud Sync Status
+  const [isOnline, setIsOnline] = useState<boolean>(() => (typeof navigator !== 'undefined' ? navigator.onLine : true));
+  const [syncStatus, setSyncStatus] = useState<'synced' | 'syncing' | 'offline' | 'error'>('syncing');
+  const [lastSyncedAt, setLastSyncedAt] = useState<string | null>(null);
+  const [syncError, setSyncError] = useState<string | null>(null);
+
+  // Products state (defaults to initial/cached, updated live by Firestore)
   const [products, setProducts] = useState<Product[]>(() => {
-    const saved = localStorage.getItem(STORAGE_KEYS.PRODUCTS);
-    return saved ? JSON.parse(saved) : INITIAL_PRODUCTS;
+    try {
+      const saved = localStorage.getItem(STORAGE_KEYS.PRODUCTS);
+      return saved ? JSON.parse(saved) : INITIAL_PRODUCTS;
+    } catch {
+      return INITIAL_PRODUCTS;
+    }
   });
 
-  // Cart state
+  // Cart state (local to terminal until checkout)
   const [cart, setCart] = useState<CartItem[]>([]);
   const [overallDiscount, setOverallDiscount] = useState<number>(0);
 
-  // Held bills
+  // Held bills (synchronized across terminals)
   const [heldBills, setHeldBills] = useState<HeldBill[]>(() => {
-    const saved = localStorage.getItem(STORAGE_KEYS.HELD_BILLS);
-    return saved ? JSON.parse(saved) : [];
+    try {
+      const saved = localStorage.getItem(STORAGE_KEYS.HELD_BILLS);
+      return saved ? JSON.parse(saved) : [];
+    } catch {
+      return [];
+    }
   });
 
   // Transactions
   const [transactions, setTransactions] = useState<BillTransaction[]>(() => {
-    const saved = localStorage.getItem(STORAGE_KEYS.TRANSACTIONS);
-    return saved ? JSON.parse(saved) : generateInitialTransactions();
+    try {
+      const saved = localStorage.getItem(STORAGE_KEYS.TRANSACTIONS);
+      return saved ? JSON.parse(saved) : generateInitialTransactions();
+    } catch {
+      return generateInitialTransactions();
+    }
   });
 
   // Queues
   const [queues, setQueues] = useState<QueueItem[]>(() => {
-    const saved = localStorage.getItem(STORAGE_KEYS.QUEUES);
-    return saved ? JSON.parse(saved) : INITIAL_QUEUES;
+    try {
+      const saved = localStorage.getItem(STORAGE_KEYS.QUEUES);
+      return saved ? JSON.parse(saved) : INITIAL_QUEUES;
+    } catch {
+      return INITIAL_QUEUES;
+    }
   });
 
   // Stock movements
   const [stockMovements, setStockMovements] = useState<StockMovement[]>(() => {
-    const saved = localStorage.getItem(STORAGE_KEYS.MOVEMENTS);
-    return saved ? JSON.parse(saved) : INITIAL_STOCK_MOVEMENTS;
+    try {
+      const saved = localStorage.getItem(STORAGE_KEYS.MOVEMENTS);
+      return saved ? JSON.parse(saved) : INITIAL_STOCK_MOVEMENTS;
+    } catch {
+      return INITIAL_STOCK_MOVEMENTS;
+    }
   });
 
   // Daily closings
   const [dailyClosings, setDailyClosings] = useState<DailyClosingRecord[]>(() => {
-    const saved = localStorage.getItem(STORAGE_KEYS.CLOSINGS);
-    return saved ? JSON.parse(saved) : INITIAL_DAILY_CLOSINGS;
+    try {
+      const saved = localStorage.getItem(STORAGE_KEYS.CLOSINGS);
+      return saved ? JSON.parse(saved) : INITIAL_DAILY_CLOSINGS;
+    } catch {
+      return INITIAL_DAILY_CLOSINGS;
+    }
   });
 
   // Staff
   const [staffList, setStaffList] = useState<StaffUser[]>(() => {
-    const saved = localStorage.getItem('pos_staff_list_v2');
-    return saved ? JSON.parse(saved) : INITIAL_STAFF;
+    try {
+      const saved = localStorage.getItem('pos_staff_list_v2');
+      return saved ? JSON.parse(saved) : INITIAL_STAFF;
+    } catch {
+      return INITIAL_STAFF;
+    }
   });
 
   const [currentStaff, setCurrentStaff] = useState<StaffUser>(() => {
-    const saved = localStorage.getItem(STORAGE_KEYS.STAFF_CURRENT);
-    if (saved) {
-      const found = INITIAL_STAFF.find((s) => s.id === saved);
-      if (found) return found;
+    try {
+      const saved = localStorage.getItem(STORAGE_KEYS.STAFF_CURRENT);
+      if (saved) {
+        const found = INITIAL_STAFF.find((s) => s.id === saved);
+        if (found) return found;
+      }
+    } catch {
+      // fallback
     }
-    return INITIAL_STAFF[0]; // Admin by default for full preview
+    return INITIAL_STAFF[0];
   });
-
-  useEffect(() => {
-    localStorage.setItem('pos_staff_list_v2', JSON.stringify(staffList));
-    saveSecureData('pos_staff_list_v2', staffList);
-  }, [staffList]);
 
   // Store settings
   const [settings, setSettings] = useState<StoreSettings>(() => {
-    const saved = localStorage.getItem(STORAGE_KEYS.SETTINGS);
-    return saved ? JSON.parse(saved) : INITIAL_SETTINGS;
+    try {
+      const saved = localStorage.getItem(STORAGE_KEYS.SETTINGS);
+      return saved ? JSON.parse(saved) : INITIAL_SETTINGS;
+    } catch {
+      return INITIAL_SETTINGS;
+    }
   });
 
   // Activity logs
   const [activityLogs, setActivityLogs] = useState<ActivityLog[]>(() => {
-    const saved = localStorage.getItem(STORAGE_KEYS.LOGS);
-    return saved
-      ? JSON.parse(saved)
-      : [
-          {
-            id: 'log-01',
-            timestamp: new Date().toISOString(),
-            userId: 'staff-admin',
-            userName: 'สมชาย ผู้ดูแลระบบ (Admin)',
-            action: 'เข้าสู่ระบบ',
-            details: 'เปิดระบบจัดการหน้าร้าน POS สำเร็จ',
-          },
-        ];
+    try {
+      const saved = localStorage.getItem(STORAGE_KEYS.LOGS);
+      return saved
+        ? JSON.parse(saved)
+        : [
+            {
+              id: 'log-01',
+              timestamp: new Date().toISOString(),
+              userId: 'staff-admin',
+              userName: 'สมชาย ผู้ดูแลระบบ (Admin)',
+              action: 'เข้าสู่ระบบ',
+              details: 'เปิดระบบจัดการหน้าร้าน POS สำเร็จ',
+            },
+          ];
+    } catch {
+      return [];
+    }
   });
 
-  // Persistence effects (LocalStorage + IndexedDB via localForage)
-  useEffect(() => {
-    localStorage.setItem(STORAGE_KEYS.PRODUCTS, JSON.stringify(products));
-    saveSecureData(STORAGE_KEYS.PRODUCTS, products);
-  }, [products]);
+  // Keep track of Firestore initialized status
+  const isMigratedRef = useRef(false);
 
+  // Monitor browser online/offline status
   useEffect(() => {
-    localStorage.setItem(STORAGE_KEYS.TRANSACTIONS, JSON.stringify(transactions));
-    saveSecureData(STORAGE_KEYS.TRANSACTIONS, transactions);
-  }, [transactions]);
+    const handleOnline = () => {
+      setIsOnline(true);
+      setSyncStatus('synced');
+      setSyncError(null);
+    };
+    const handleOffline = () => {
+      setIsOnline(false);
+      setSyncStatus('offline');
+      setSyncError('ไม่มีการเชื่อมต่ออินเทอร์เน็ต ข้อมูลยังไม่ได้ซิงก์');
+    };
 
+    window.addEventListener('online', handleOnline);
+    window.addEventListener('offline', handleOffline);
+    return () => {
+      window.removeEventListener('online', handleOnline);
+      window.removeEventListener('offline', handleOffline);
+    };
+  }, []);
+
+  // -------------------------------------------------------------
+  // REAL-TIME FIRESTORE SUBSCRIPTIONS (Cross-Device Cloud Sync)
+  // -------------------------------------------------------------
   useEffect(() => {
-    localStorage.setItem(STORAGE_KEYS.QUEUES, JSON.stringify(queues));
-    saveSecureData(STORAGE_KEYS.QUEUES, queues);
-  }, [queues]);
+    let unsubProducts: () => void = () => {};
+    let unsubTransactions: () => void = () => {};
+    let unsubQueues: () => void = () => {};
+    let unsubMovements: () => void = () => {};
+    let unsubClosings: () => void = () => {};
+    let unsubHeldBills: () => void = () => {};
+    let unsubSettings: () => void = () => {};
+    let unsubStaff: () => void = () => {};
+    let unsubLogs: () => void = () => {};
 
-  useEffect(() => {
-    localStorage.setItem(STORAGE_KEYS.MOVEMENTS, JSON.stringify(stockMovements));
-    saveSecureData(STORAGE_KEYS.MOVEMENTS, stockMovements);
-  }, [stockMovements]);
+    async function initFirestoreSync() {
+      try {
+        setSyncStatus('syncing');
+        await ensureTerminalAuth();
+        await testFirestoreConnection();
 
-  useEffect(() => {
-    localStorage.setItem(STORAGE_KEYS.CLOSINGS, JSON.stringify(dailyClosings));
-    saveSecureData(STORAGE_KEYS.CLOSINGS, dailyClosings);
-  }, [dailyClosings]);
+        // 1. Subscribe to Products
+        const productsCol = collection(db, 'products');
+        unsubProducts = onSnapshot(
+          productsCol,
+          async (snapshot) => {
+            if (snapshot.empty && !isMigratedRef.current) {
+              isMigratedRef.current = true;
+              // If central Firestore database has no products yet, seed initial items
+              try {
+                const batch = writeBatch(db);
+                const seedList = products.length > 0 ? products : INITIAL_PRODUCTS;
+                seedList.forEach((p) => {
+                  const ref = doc(db, 'products', p.id);
+                  batch.set(ref, formatProductForFirestore(p));
+                });
+                await batch.commit();
+              } catch (seedErr) {
+                console.warn('Initial products seed notice:', seedErr);
+              }
+              return;
+            }
 
-  useEffect(() => {
-    localStorage.setItem(STORAGE_KEYS.HELD_BILLS, JSON.stringify(heldBills));
-    saveSecureData(STORAGE_KEYS.HELD_BILLS, heldBills);
-  }, [heldBills]);
+            const liveProducts: Product[] = [];
+            snapshot.forEach((docSnap) => {
+              const data = docSnap.data();
+              liveProducts.push({
+                id: docSnap.id,
+                name: data.name || data.product_name || '',
+                product_name: data.name || data.product_name || '',
+                category: data.category || 'ทั่วไป',
+                sku: data.sku || data.barcode || docSnap.id,
+                barcode: data.barcode || '',
+                costPrice: Number(data.costPrice ?? data.cost_price ?? 0),
+                cost_price: Number(data.costPrice ?? data.cost_price ?? 0),
+                sellingPrice: Number(data.sellingPrice ?? data.selling_price ?? 0),
+                selling_price: Number(data.sellingPrice ?? data.selling_price ?? 0),
+                stock: Number(data.stock ?? 0),
+                unit: data.unit || 'ชิ้น',
+                minStock: Number(data.minStock ?? data.min_stock ?? 0),
+                min_stock: Number(data.min_stock ?? data.minStock ?? 0),
+                image: data.image || data.image_url || '',
+                image_url: data.image || data.image_url || '',
+                description: data.description || '',
+                minProfit: Number(data.minProfit ?? data.minimum_profit ?? 0),
+                minimum_profit: Number(data.minProfit ?? data.minimum_profit ?? 0),
+                minProfitType: data.minProfitType || 'amount',
+                createdAt: data.createdAt || data.created_at,
+                created_at: data.createdAt || data.created_at,
+                updatedAt: data.updatedAt || data.updated_at,
+                updated_at: data.updatedAt || data.updated_at,
+              });
+            });
 
-  useEffect(() => {
-    localStorage.setItem(STORAGE_KEYS.SETTINGS, JSON.stringify(settings));
-    saveSecureData(STORAGE_KEYS.SETTINGS, settings);
-  }, [settings]);
+            // Sort products by name or creation
+            liveProducts.sort((a, b) => a.name.localeCompare(b.name, 'th'));
 
-  useEffect(() => {
-    localStorage.setItem(STORAGE_KEYS.STAFF_CURRENT, currentStaff.id);
-    saveSecureData(STORAGE_KEYS.STAFF_CURRENT, currentStaff.id);
-  }, [currentStaff]);
+            setProducts(liveProducts);
+            localStorage.setItem(STORAGE_KEYS.PRODUCTS, JSON.stringify(liveProducts));
+            saveSecureData(STORAGE_KEYS.PRODUCTS, liveProducts);
+            setSyncStatus('synced');
+            setLastSyncedAt(new Date().toLocaleTimeString('th-TH'));
+          },
+          (err) => {
+            console.error('Firestore products sync error:', err);
+            setSyncStatus('error');
+            setSyncError('เกิดข้อผิดพลาดในการเชื่อมต่อฐานข้อมูลออนไลน์');
+          }
+        );
 
-  useEffect(() => {
-    localStorage.setItem(STORAGE_KEYS.LOGS, JSON.stringify(activityLogs));
-    saveSecureData(STORAGE_KEYS.LOGS, activityLogs);
-  }, [activityLogs]);
+        // 2. Subscribe to Transactions
+        const txCol = collection(db, 'transactions');
+        unsubTransactions = onSnapshot(
+          txCol,
+          (snapshot) => {
+            const liveTx: BillTransaction[] = [];
+            snapshot.forEach((docSnap) => {
+              liveTx.push(docSnap.data() as BillTransaction);
+            });
+            // Sort by timestamp desc
+            liveTx.sort((a, b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime());
+            if (liveTx.length > 0) {
+              setTransactions(liveTx);
+              localStorage.setItem(STORAGE_KEYS.TRANSACTIONS, JSON.stringify(liveTx));
+              saveSecureData(STORAGE_KEYS.TRANSACTIONS, liveTx);
+            }
+          },
+          (err) => console.warn('Transactions sync warning:', err)
+        );
 
-  // Log activity helper
-  const addActivityLog = (action: string, details: string, beforeState?: string, afterState?: string) => {
+        // 3. Subscribe to Queues
+        const queueCol = collection(db, 'queues');
+        unsubQueues = onSnapshot(
+          queueCol,
+          (snapshot) => {
+            const liveQueues: QueueItem[] = [];
+            snapshot.forEach((docSnap) => {
+              liveQueues.push(docSnap.data() as QueueItem);
+            });
+            liveQueues.sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
+            if (liveQueues.length > 0) {
+              setQueues(liveQueues);
+              localStorage.setItem(STORAGE_KEYS.QUEUES, JSON.stringify(liveQueues));
+              saveSecureData(STORAGE_KEYS.QUEUES, liveQueues);
+            }
+          },
+          (err) => console.warn('Queues sync warning:', err)
+        );
+
+        // 4. Subscribe to Stock Movements
+        const movementCol = collection(db, 'stockMovements');
+        unsubMovements = onSnapshot(
+          movementCol,
+          (snapshot) => {
+            const liveMovements: StockMovement[] = [];
+            snapshot.forEach((docSnap) => {
+              liveMovements.push(docSnap.data() as StockMovement);
+            });
+            liveMovements.sort((a, b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime());
+            if (liveMovements.length > 0) {
+              setStockMovements(liveMovements);
+              localStorage.setItem(STORAGE_KEYS.MOVEMENTS, JSON.stringify(liveMovements));
+              saveSecureData(STORAGE_KEYS.MOVEMENTS, liveMovements);
+            }
+          },
+          (err) => console.warn('StockMovements sync warning:', err)
+        );
+
+        // 5. Subscribe to Daily Closings
+        const closingCol = collection(db, 'dailyClosings');
+        unsubClosings = onSnapshot(
+          closingCol,
+          (snapshot) => {
+            const liveClosings: DailyClosingRecord[] = [];
+            snapshot.forEach((docSnap) => {
+              liveClosings.push(docSnap.data() as DailyClosingRecord);
+            });
+            liveClosings.sort((a, b) => new Date(b.closedAt).getTime() - new Date(a.closedAt).getTime());
+            if (liveClosings.length > 0) {
+              setDailyClosings(liveClosings);
+              localStorage.setItem(STORAGE_KEYS.CLOSINGS, JSON.stringify(liveClosings));
+              saveSecureData(STORAGE_KEYS.CLOSINGS, liveClosings);
+            }
+          },
+          (err) => console.warn('DailyClosings sync warning:', err)
+        );
+
+        // 6. Subscribe to Held Bills (cross-terminal bill holding)
+        const heldCol = collection(db, 'heldBills');
+        unsubHeldBills = onSnapshot(
+          heldCol,
+          (snapshot) => {
+            const liveHeld: HeldBill[] = [];
+            snapshot.forEach((docSnap) => {
+              liveHeld.push(docSnap.data() as HeldBill);
+            });
+            setHeldBills(liveHeld);
+            localStorage.setItem(STORAGE_KEYS.HELD_BILLS, JSON.stringify(liveHeld));
+          },
+          (err) => console.warn('HeldBills sync warning:', err)
+        );
+
+        // 7. Subscribe to Store Settings
+        const settingsDocRef = doc(db, 'settings', 'store_config');
+        unsubSettings = onSnapshot(
+          settingsDocRef,
+          async (snapshot) => {
+            if (snapshot.exists()) {
+              const liveSettings = snapshot.data() as StoreSettings;
+              setSettings(liveSettings);
+              localStorage.setItem(STORAGE_KEYS.SETTINGS, JSON.stringify(liveSettings));
+            } else {
+              // Seed settings if missing
+              try {
+                await setDoc(settingsDocRef, INITIAL_SETTINGS);
+              } catch (e) {
+                console.warn('Seed settings error:', e);
+              }
+            }
+          },
+          (err) => console.warn('Settings sync warning:', err)
+        );
+
+        // 8. Subscribe to Staff List
+        const staffCol = collection(db, 'staff');
+        unsubStaff = onSnapshot(
+          staffCol,
+          async (snapshot) => {
+            if (snapshot.empty) {
+              // Seed staff list
+              try {
+                const batch = writeBatch(db);
+                INITIAL_STAFF.forEach((s) => {
+                  batch.set(doc(db, 'staff', s.id), s);
+                });
+                await batch.commit();
+              } catch (e) {
+                console.warn('Seed staff error:', e);
+              }
+              return;
+            }
+            const liveStaff: StaffUser[] = [];
+            snapshot.forEach((docSnap) => {
+              liveStaff.push(docSnap.data() as StaffUser);
+            });
+            setStaffList(liveStaff);
+            localStorage.setItem('pos_staff_list_v2', JSON.stringify(liveStaff));
+          },
+          (err) => console.warn('Staff sync warning:', err)
+        );
+
+        // 9. Subscribe to Activity Logs (recent 100)
+        const logsCol = collection(db, 'activityLogs');
+        unsubLogs = onSnapshot(
+          logsCol,
+          (snapshot) => {
+            const liveLogs: ActivityLog[] = [];
+            snapshot.forEach((docSnap) => {
+              liveLogs.push(docSnap.data() as ActivityLog);
+            });
+            liveLogs.sort((a, b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime());
+            if (liveLogs.length > 0) {
+              setActivityLogs(liveLogs.slice(0, 100));
+            }
+          },
+          (err) => console.warn('ActivityLogs sync warning:', err)
+        );
+      } catch (err) {
+        console.error('Failed to initialize Firestore sync:', err);
+        setSyncStatus('error');
+        setSyncError('ไม่สามารถเชื่อมต่อฐานข้อมูลออนไลน์ได้');
+      }
+    }
+
+    initFirestoreSync();
+
+    return () => {
+      unsubProducts();
+      unsubTransactions();
+      unsubQueues();
+      unsubMovements();
+      unsubClosings();
+      unsubHeldBills();
+      unsubSettings();
+      unsubStaff();
+      unsubLogs();
+    };
+  }, []);
+
+  // Helper for logging
+  const addActivityLog = async (action: string, details: string, beforeState?: string, afterState?: string) => {
     const newLog: ActivityLog = {
       id: `log-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`,
       timestamp: new Date().toISOString(),
@@ -283,7 +575,12 @@ export const POSProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
       beforeState,
       afterState,
     };
-    setActivityLogs((prev) => [newLog, ...prev.slice(0, 150)]);
+    setActivityLogs((prev) => [newLog, ...prev.slice(0, 99)]);
+    try {
+      await setDoc(doc(db, 'activityLogs', newLog.id), newLog);
+    } catch {
+      // Local fallback
+    }
   };
 
   // Check if today is already closed
@@ -296,7 +593,7 @@ export const POSProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
     return queues.find((q) => q.status === 'calling') || null;
   }, [queues]);
 
-  // Cart operations
+  // Cart operations (client-side till payment)
   const addToCart = (product: Product, quantity: number = 1) => {
     setCart((prev) => {
       const existing = prev.find((item) => item.product.id === product.id);
@@ -342,7 +639,7 @@ export const POSProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
           const rawTotal = item.quantity * item.product.sellingPrice;
           let calculatedDiscount = 0;
           if (discountType === 'percent') {
-            calculatedDiscount = Math.round((rawTotal * (discountVal / 100)) * 100) / 100;
+            calculatedDiscount = Math.round(rawTotal * (discountVal / 100) * 100) / 100;
           } else {
             calculatedDiscount = Math.min(rawTotal, Math.max(0, discountVal));
           }
@@ -368,7 +665,7 @@ export const POSProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
     setOverallDiscount(0);
   };
 
-  // Hold / Restore Bills
+  // Hold / Restore Bills (Cloud Synced across all terminals)
   const holdCurrentBill = (name?: string): boolean => {
     if (cart.length === 0) return false;
     const newHold: HeldBill = {
@@ -382,6 +679,12 @@ export const POSProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
     setHeldBills((prev) => [newHold, ...prev]);
     clearCart();
     addActivityLog('พักบิล', `พักบิล: ${newHold.name}`);
+
+    // Persist to central Firestore
+    setDoc(doc(db, 'heldBills', newHold.id), newHold).catch((err) => {
+      console.warn('Hold bill sync warning:', err);
+    });
+
     return true;
   };
 
@@ -392,6 +695,11 @@ export const POSProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
     setOverallDiscount(bill.overallDiscount);
     setHeldBills((prev) => prev.filter((b) => b.id !== heldBillId));
     addActivityLog('ดึงบิลที่พักไว้', `ดึงบิล ${bill.name} กลับมาขายต่อ`);
+
+    // Remove from Firestore
+    deleteDoc(doc(db, 'heldBills', heldBillId)).catch((err) => {
+      console.warn('Remove held bill error:', err);
+    });
   };
 
   const deleteHeldBill = (heldBillId: string) => {
@@ -400,24 +708,35 @@ export const POSProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
     if (bill) {
       addActivityLog('ยกเลิกบิลพัก', `ลบบิลพัก: ${bill.name}`);
     }
+    deleteDoc(doc(db, 'heldBills', heldBillId)).catch((err) => {
+      console.warn('Delete held bill error:', err);
+    });
   };
 
-  // Process Checkout
-  const processCheckout = (
+  // -------------------------------------------------------------
+  // ATOMIC CHECKOUT & STOCK DEDUCTION (Cross-Device Central Stock)
+  // -------------------------------------------------------------
+  const processCheckout = async (
     paymentMethod: PaymentMethod,
     cashReceived?: number,
     splitDetails?: SplitPaymentDetail,
     customerName?: string
-  ): { transaction: BillTransaction; queue: QueueItem } => {
+  ): Promise<{ transaction: BillTransaction; queue: QueueItem }> => {
+    if (!navigator.onLine || syncStatus === 'offline') {
+      throw new Error('ไม่มีการเชื่อมต่ออินเทอร์เน็ต ข้อมูลยังไม่ได้ซิงก์');
+    }
+
+    if (cart.length === 0) {
+      throw new Error('ไม่มีสินค้าในตะกร้า');
+    }
+
     const now = new Date();
     const dateStr = now.toISOString().split('T')[0];
     const timeStr = now.toTimeString().split(' ')[0];
 
-    // Compute bill number
+    // Compute bill and unique queue numbers
     const billCounter = transactions.length + 1001;
     const billNumber = `INV-${now.getFullYear()}${(now.getMonth() + 1).toString().padStart(2, '0')}-${billCounter}`;
-
-    // Queue numbering
     const queueCounter = (queues.length % 99) + 1;
     const queueNumber = `A-${queueCounter.toString().padStart(2, '0')}`;
 
@@ -433,7 +752,7 @@ export const POSProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
         : undefined;
 
     const transaction: BillTransaction = {
-      id: `tx-${Date.now()}`,
+      id: `tx-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
       billNumber,
       queueNumber,
       timestamp: now.toISOString(),
@@ -466,27 +785,61 @@ export const POSProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
       status: 'completed',
     };
 
-    // 1. Cut stock immediately for all items
-    const newMovements: StockMovement[] = [];
+    // Prepare movements
+    const newMovements: StockMovement[] = cart.map((item) => {
+      const currentProd = products.find((p) => p.id === item.product.id);
+      const prevStock = currentProd ? currentProd.stock : item.product.stock;
+      return {
+        id: `sm-${Date.now()}-${item.product.id}-${Math.random().toString(36).slice(2, 6)}`,
+        timestamp: now.toISOString(),
+        productId: item.product.id,
+        productName: item.product.name,
+        sku: item.product.sku,
+        type: 'sale',
+        quantityChange: -item.quantity,
+        previousStock: prevStock,
+        newStock: Math.max(0, prevStock - item.quantity),
+        reason: `ขายบิล ${billNumber}`,
+        staffName: currentStaff.name,
+      };
+    });
+
+    // Create queue record
+    const queueItem: QueueItem = {
+      id: `q-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+      queueNumber,
+      billNumber,
+      customerName: customerName || `ลูกค้าคิว ${queueNumber}`,
+      status: 'waiting',
+      createdAt: now.toISOString(),
+    };
+
+    // Execute atomic checkout on Cloud Firestore:
+    // 1. Reads all products
+    // 2. Verifies stock >= quantity for each item (fails and throws if insufficient)
+    // 3. Atomically updates stock for all products
+    // 4. Writes transaction, queue, and stock movements in one commit
+    setSyncStatus('syncing');
+    try {
+      await processAtomicCheckoutInFirestore({
+        transactionData: transaction,
+        queueData: queueItem,
+        movementsData: newMovements,
+      });
+      setSyncStatus('synced');
+      setLastSyncedAt(new Date().toLocaleTimeString('th-TH'));
+    } catch (err: any) {
+      setSyncStatus('error');
+      setSyncError(err.message || 'ไม่มีการเชื่อมต่ออินเทอร์เน็ต ข้อมูลยังไม่ได้ซิงก์');
+      throw err;
+    }
+
+    // Update local state ONLY after Firestore transaction succeeded
     setProducts((prevProducts) =>
       prevProducts.map((prod) => {
         const cartItem = cart.find((ci) => ci.product.id === prod.id);
         if (cartItem) {
-          const newStock = Math.max(0, prod.stock - cartItem.quantity);
-          newMovements.push({
-            id: `sm-${Date.now()}-${prod.id}`,
-            timestamp: now.toISOString(),
-            productId: prod.id,
-            productName: prod.name,
-            sku: prod.sku,
-            type: 'sale',
-            quantityChange: -cartItem.quantity,
-            previousStock: prod.stock,
-            newStock,
-            reason: `ขายบิล ${billNumber}`,
-            staffName: currentStaff.name,
-          });
-          return { ...prod, stock: newStock };
+          return { ...prod, stock: Math.max(0, prod.stock - cartItem.quantity) };
         }
         return prod;
       })
@@ -496,24 +849,10 @@ export const POSProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
       setStockMovements((prev) => [...newMovements, ...prev]);
     }
 
-    // 2. Create queue record
-    const queueItem: QueueItem = {
-      id: `q-${Date.now()}`,
-      queueNumber,
-      billNumber,
-      customerName: customerName || `ลูกค้าคิว ${queueNumber}`,
-      status: 'waiting',
-      createdAt: now.toISOString(),
-    };
     setQueues((prev) => [queueItem, ...prev]);
-
-    // 3. Save transaction
     setTransactions((prev) => [transaction, ...prev]);
-
-    // 4. Clear cart
     clearCart();
 
-    // 5. Activity log
     addActivityLog(
       'ขายสินค้า (POS)',
       `เปิดบิล ${billNumber} (${queueNumber}) ยอด ฿${grandTotal.toLocaleString()} โดยวิธี ${paymentMethod}`
@@ -557,7 +896,6 @@ export const POSProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
       setStockMovements((prev) => [...refundMovements, ...prev]);
     }
 
-    // Update transaction status
     setTransactions((prev) =>
       prev.map((t) =>
         t.id === transactionId
@@ -573,21 +911,86 @@ export const POSProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
     );
 
     addActivityLog('คืนสินค้า / ยกเลิกบิล', `คืนเงินบิล ${tx.billNumber} ยอด ฿${tx.grandTotal.toLocaleString()} เหตุผล: ${reason}`);
+
+    // Update Firestore centrally
+    (async () => {
+      try {
+        await updateDoc(doc(db, 'transactions', transactionId), {
+          status: 'refunded',
+          refundReason: reason,
+          refundTimestamp: new Date().toISOString(),
+          refundedBy: currentStaff.name,
+        });
+
+        for (const item of tx.items) {
+          const p = products.find((prod) => prod.id === item.productId);
+          if (p) {
+            await updateDoc(doc(db, 'products', item.productId), {
+              stock: p.stock + item.quantity,
+              updatedAt: new Date().toISOString(),
+              updated_at: new Date().toISOString(),
+            });
+          }
+        }
+
+        for (const mov of refundMovements) {
+          await setDoc(doc(db, 'stockMovements', mov.id), mov);
+        }
+      } catch (err) {
+        console.error('Refund Firestore sync error:', err);
+      }
+    })();
+
     return true;
   };
 
-  // Inventory Management
+  // -------------------------------------------------------------
+  // INVENTORY MANAGEMENT (Direct Central Firestore Integration)
+  // -------------------------------------------------------------
   const addProduct = (productData: Omit<Product, 'id'>): Product => {
+    if (!navigator.onLine) {
+      alert('ไม่มีการเชื่อมต่ออินเทอร์เน็ต ข้อมูลยังไม่ได้ซิงก์');
+    }
+
+    const newId = `prod-${Date.now()}`;
+    const formatted = formatProductForFirestore({
+      ...productData,
+      id: newId,
+    });
+
     const newProduct: Product = {
       ...productData,
-      id: `prod-${Date.now()}`,
-      updatedAt: new Date().toISOString(),
+      id: newId,
+      name: formatted.name,
+      product_name: formatted.product_name,
+      sku: formatted.sku,
+      barcode: formatted.barcode,
+      costPrice: formatted.costPrice,
+      cost_price: formatted.cost_price,
+      sellingPrice: formatted.sellingPrice,
+      selling_price: formatted.selling_price,
+      stock: formatted.stock,
+      unit: formatted.unit,
+      minStock: formatted.minStock,
+      min_stock: formatted.min_stock,
+      image: formatted.image,
+      image_url: formatted.image_url,
+      minProfit: formatted.minProfit,
+      minimum_profit: formatted.minimum_profit,
+      minProfitType: formatted.minProfitType as 'amount' | 'percent',
+      createdAt: formatted.createdAt,
+      created_at: formatted.created_at,
+      updatedAt: formatted.updatedAt,
+      updated_at: formatted.updated_at,
     };
+
+    // Optimistic local update
     setProducts((prev) => [newProduct, ...prev]);
 
-    // Log initial stock movement if > 0
+    // Initial stock movement
+    let initialMovement: StockMovement | null = null;
     if (newProduct.stock > 0) {
-      const movement: StockMovement = {
+      initialMovement = {
         id: `sm-init-${Date.now()}`,
         timestamp: new Date().toISOString(),
         productId: newProduct.id,
@@ -600,19 +1003,45 @@ export const POSProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
         reason: 'เพิ่มสินค้าเข้าระบบครั้งแรก',
         staffName: currentStaff.name,
       };
-      setStockMovements((prev) => [movement, ...prev]);
+      setStockMovements((prev) => [initialMovement!, ...prev]);
     }
 
     addActivityLog('เพิ่มสินค้าใหม่', `เพิ่ม ${newProduct.name} (SKU: ${newProduct.sku}) สต็อก ${newProduct.stock} ${newProduct.unit}`);
+
+    // Central Firestore write
+    (async () => {
+      try {
+        setSyncStatus('syncing');
+        await setDoc(doc(db, 'products', newProduct.id), formatted);
+        if (initialMovement) {
+          await setDoc(doc(db, 'stockMovements', initialMovement.id), initialMovement);
+        }
+        setSyncStatus('synced');
+        setLastSyncedAt(new Date().toLocaleTimeString('th-TH'));
+      } catch (err) {
+        console.error('Error adding product to Firestore:', err);
+        setSyncStatus('error');
+        setSyncError('ไม่มีการเชื่อมต่ออินเทอร์เน็ต ข้อมูลยังไม่ได้ซิงก์');
+      }
+    })();
+
     return newProduct;
   };
 
   const updateProduct = (id: string, updates: Partial<Product>) => {
+    if (!navigator.onLine) {
+      alert('ไม่มีการเชื่อมต่ออินเทอร์เน็ต ข้อมูลยังไม่ได้ซิงก์');
+    }
+
     const target = products.find((p) => p.id === id);
     if (!target) return;
 
+    const merged = { ...target, ...updates, updatedAt: new Date().toISOString(), updated_at: new Date().toISOString() };
+    const formatted = formatProductForFirestore(merged);
+
+    // Optimistic local update
     setProducts((prev) =>
-      prev.map((p) => (p.id === id ? { ...p, ...updates, updatedAt: new Date().toISOString() } : p))
+      prev.map((p) => (p.id === id ? { ...p, ...updates, updatedAt: formatted.updatedAt, updated_at: formatted.updated_at } : p))
     );
 
     addActivityLog(
@@ -621,14 +1050,47 @@ export const POSProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
       JSON.stringify({ name: target.name, price: target.sellingPrice, cost: target.costPrice }),
       JSON.stringify(updates)
     );
+
+    // Central Firestore write
+    (async () => {
+      try {
+        setSyncStatus('syncing');
+        await updateDoc(doc(db, 'products', id), formatted);
+        setSyncStatus('synced');
+        setLastSyncedAt(new Date().toLocaleTimeString('th-TH'));
+      } catch (err) {
+        console.error('Error updating product in Firestore:', err);
+        setSyncStatus('error');
+        setSyncError('ไม่มีการเชื่อมต่ออินเทอร์เน็ต ข้อมูลยังไม่ได้ซิงก์');
+      }
+    })();
   };
 
   const deleteProduct = (id: string) => {
+    if (!navigator.onLine) {
+      alert('ไม่มีการเชื่อมต่ออินเทอร์เน็ต ข้อมูลยังไม่ได้ซิงก์');
+    }
+
     const target = products.find((p) => p.id === id);
     if (!target) return;
 
+    // Optimistic local update
     setProducts((prev) => prev.filter((p) => p.id !== id));
     addActivityLog('ลบสินค้า', `ลบสินค้า ${target.name} (SKU: ${target.sku})`);
+
+    // Central Firestore write
+    (async () => {
+      try {
+        setSyncStatus('syncing');
+        await deleteDoc(doc(db, 'products', id));
+        setSyncStatus('synced');
+        setLastSyncedAt(new Date().toLocaleTimeString('th-TH'));
+      } catch (err) {
+        console.error('Error deleting product from Firestore:', err);
+        setSyncStatus('error');
+        setSyncError('ไม่มีการเชื่อมต่ออินเทอร์เน็ต ข้อมูลยังไม่ได้ซิงก์');
+      }
+    })();
   };
 
   const adjustStock = (
@@ -637,19 +1099,24 @@ export const POSProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
     type: StockMovementType,
     reason: string
   ) => {
+    if (!navigator.onLine) {
+      alert('ไม่มีการเชื่อมต่ออินเทอร์เน็ต ข้อมูลยังไม่ได้ซิงก์');
+    }
+
     const target = products.find((p) => p.id === productId);
     if (!target) return;
 
     const previousStock = target.stock;
     const newStock = Math.max(0, previousStock + quantityChange);
+    const now = new Date().toISOString();
 
     setProducts((prev) =>
-      prev.map((p) => (p.id === productId ? { ...p, stock: newStock } : p))
+      prev.map((p) => (p.id === productId ? { ...p, stock: newStock, updatedAt: now, updated_at: now } : p))
     );
 
     const movement: StockMovement = {
       id: `sm-adj-${Date.now()}`,
-      timestamp: new Date().toISOString(),
+      timestamp: now,
       productId: target.id,
       productName: target.name,
       sku: target.sku,
@@ -668,66 +1135,107 @@ export const POSProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
       `สต็อกเดิม: ${previousStock}`,
       `สต็อกใหม่: ${newStock}`
     );
+
+    // Central Firestore write
+    (async () => {
+      try {
+        setSyncStatus('syncing');
+        await updateDoc(doc(db, 'products', productId), {
+          stock: newStock,
+          updatedAt: now,
+          updated_at: now,
+        });
+        await setDoc(doc(db, 'stockMovements', movement.id), movement);
+        setSyncStatus('synced');
+        setLastSyncedAt(new Date().toLocaleTimeString('th-TH'));
+      } catch (err) {
+        console.error('Error adjusting stock in Firestore:', err);
+        setSyncStatus('error');
+        setSyncError('ไม่มีการเชื่อมต่ออินเทอร์เน็ต ข้อมูลยังไม่ได้ซิงก์');
+      }
+    })();
   };
 
   const importProductsBulk = (newProducts: Product[], mode: 'replace' | 'merge') => {
-    if (mode === 'replace') {
-      setProducts(newProducts);
-      addActivityLog(
-        'นำเข้าสินค้าจาก Google Sheets',
-        `แทนที่รายการสินค้าทั้งหมดด้วยข้อมูลจาก Google Sheets จำนวน ${newProducts.length} รายการ`
-      );
-    } else {
-      setProducts((prev) => {
-        const merged = [...prev];
-        newProducts.forEach((incoming) => {
-          const existingIdx = merged.findIndex(
-            (p) => (incoming.barcode && p.barcode === incoming.barcode) || (incoming.sku && p.sku === incoming.sku)
-          );
-          if (existingIdx !== -1) {
-            merged[existingIdx] = {
-              ...merged[existingIdx],
-              ...incoming,
-              id: merged[existingIdx].id, // preserve ID
-              updatedAt: new Date().toISOString(),
-            };
-          } else {
-            merged.push({
-              ...incoming,
-              id: incoming.id || `prod-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
-              updatedAt: new Date().toISOString(),
-            });
-          }
+    (async () => {
+      try {
+        setSyncStatus('syncing');
+        const batch = writeBatch(db);
+
+        if (mode === 'replace') {
+          // Fetch existing docs to delete
+          const snap = await getDocs(collection(db, 'products'));
+          snap.forEach((d) => batch.delete(d.ref));
+        }
+
+        newProducts.forEach((p) => {
+          const id = p.id || `prod-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`;
+          const formatted = formatProductForFirestore({ ...p, id });
+          batch.set(doc(db, 'products', id), formatted);
         });
-        return merged;
-      });
-      addActivityLog(
-        'นำเข้าสินค้าจาก Google Sheets',
-        `รวมรายการสินค้าจาก Google Sheets เพิ่มเติม/อัปเดตจำนวน ${newProducts.length} รายการ`
-      );
-    }
+
+        await batch.commit();
+        setSyncStatus('synced');
+        addActivityLog(
+          'นำเข้าสินค้าสู่ระบบคลาวด์',
+          `${mode === 'replace' ? 'แทนที่ทั้งหมด' : 'รวมข้อมูล'} จำนวน ${newProducts.length} รายการ`
+        );
+      } catch (err) {
+        console.error('Bulk import Firestore error:', err);
+        setSyncStatus('error');
+      }
+    })();
   };
 
   const clearAllProductsToBlank = () => {
-    setProducts([]);
-    setCart([]);
-    setHeldBills([]);
-    setTransactions([]);
-    setQueues([]);
-    setStockMovements([]);
-    setDailyClosings([]);
-    addActivityLog(
-      'ล้างสินค้าตัวอย่างเพื่อลงสต็อกจริง',
-      'ล้างข้อมูลสินค้าตัวอย่างและประวัติทั้งหมด (0 รายการ) เพื่อเริ่มต้นใช้งานจริงของร้าน โอเค ชัวร์'
-    );
+    (async () => {
+      try {
+        setSyncStatus('syncing');
+        const batch = writeBatch(db);
+        const prodSnap = await getDocs(collection(db, 'products'));
+        prodSnap.forEach((d) => batch.delete(d.ref));
+        const txSnap = await getDocs(collection(db, 'transactions'));
+        txSnap.forEach((d) => batch.delete(d.ref));
+        const qSnap = await getDocs(collection(db, 'queues'));
+        qSnap.forEach((d) => batch.delete(d.ref));
+        const mSnap = await getDocs(collection(db, 'stockMovements'));
+        mSnap.forEach((d) => batch.delete(d.ref));
+        const cSnap = await getDocs(collection(db, 'dailyClosings'));
+        cSnap.forEach((d) => batch.delete(d.ref));
+        const hSnap = await getDocs(collection(db, 'heldBills'));
+        hSnap.forEach((d) => batch.delete(d.ref));
+
+        await batch.commit();
+        setProducts([]);
+        setCart([]);
+        setHeldBills([]);
+        setTransactions([]);
+        setQueues([]);
+        setStockMovements([]);
+        setDailyClosings([]);
+        setSyncStatus('synced');
+        addActivityLog('ล้างฐานข้อมูลออนไลน์', 'ล้างสต็อกและประวัติทั้งหมดเพื่อเริ่มต้นใช้งานจริงของร้าน โอเค ชัวร์');
+      } catch (err) {
+        console.error('Clear DB error:', err);
+      }
+    })();
   };
 
   const resetProductsToSample = () => {
-    setProducts(SAMPLE_PRODUCTS_DEMO);
-    addActivityLog(
-      'โหลดสินค้าตัวอย่าง',
-      'รีเซ็ตรายการสินค้าตัวอย่างกลับมาสำหรับการทดสอบระบบ'
-    );
+    (async () => {
+      try {
+        setSyncStatus('syncing');
+        const batch = writeBatch(db);
+        SAMPLE_PRODUCTS_DEMO.forEach((p) => {
+          batch.set(doc(db, 'products', p.id), formatProductForFirestore(p));
+        });
+        await batch.commit();
+        setSyncStatus('synced');
+        addActivityLog('โหลดสินค้าตัวอย่างขึ้นคลาวด์', 'รีเซ็ตรายการสินค้าตัวอย่างสำหรับการทดสอบระบบ');
+      } catch (err) {
+        console.error('Reset to sample error:', err);
+      }
+    })();
   };
 
   // Queue actions
@@ -744,6 +1252,8 @@ export const POSProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
     };
     setQueues((prev) => [newQueue, ...prev]);
     addActivityLog('ออกบัตรคิว', `ออกบัตรคิวใหม่ ${queueNumber}`);
+
+    setDoc(doc(db, 'queues', newQueue.id), newQueue).catch((e) => console.warn('Queue write error:', e));
     return newQueue;
   };
 
@@ -751,12 +1261,17 @@ export const POSProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
     const target = queues.find((q) => q.id === queueId);
     if (!target) return;
 
+    const now = new Date().toISOString();
     setQueues((prev) =>
-      prev.map((q) => (q.id === queueId ? { ...q, status: 'calling', calledAt: new Date().toISOString() } : q))
+      prev.map((q) => (q.id === queueId ? { ...q, status: 'calling', calledAt: now } : q))
     );
 
     announceQueueNumber(target.queueNumber, 'เคาน์เตอร์ 1');
     addActivityLog('เรียกคิว', `เรียกคิวหมายเลข ${target.queueNumber}`);
+
+    updateDoc(doc(db, 'queues', queueId), { status: 'calling', calledAt: now }).catch((e) =>
+      console.warn('Call queue error:', e)
+    );
   };
 
   const recallQueue = (queueId: string) => {
@@ -767,8 +1282,12 @@ export const POSProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
   };
 
   const completeQueue = (queueId: string) => {
+    const now = new Date().toISOString();
     setQueues((prev) =>
-      prev.map((q) => (q.id === queueId ? { ...q, status: 'completed', completedAt: new Date().toISOString() } : q))
+      prev.map((q) => (q.id === queueId ? { ...q, status: 'completed', completedAt: now } : q))
+    );
+    updateDoc(doc(db, 'queues', queueId), { status: 'completed', completedAt: now }).catch((e) =>
+      console.warn('Complete queue error:', e)
     );
   };
 
@@ -776,11 +1295,17 @@ export const POSProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
     setQueues((prev) =>
       prev.map((q) => (q.id === queueId ? { ...q, status: 'skipped' } : q))
     );
+    updateDoc(doc(db, 'queues', queueId), { status: 'skipped' }).catch((e) =>
+      console.warn('Skip queue error:', e)
+    );
   };
 
   const cancelQueue = (queueId: string) => {
     setQueues((prev) =>
       prev.map((q) => (q.id === queueId ? { ...q, status: 'cancelled' } : q))
+    );
+    updateDoc(doc(db, 'queues', queueId), { status: 'cancelled' }).catch((e) =>
+      console.warn('Cancel queue error:', e)
     );
   };
 
@@ -856,6 +1381,10 @@ export const POSProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
       `ปิดยอดวันที่ ${todayDateStr} ยอดขาย ฿${totalSales.toLocaleString()} เงินสดจริง ฿${actualCash.toLocaleString()} ส่วนต่าง ฿${cashDifference.toLocaleString()}`
     );
 
+    setDoc(doc(db, 'dailyClosings', closingRecord.id), closingRecord).catch((e) =>
+      console.warn('Closing record write error:', e)
+    );
+
     return closingRecord;
   };
 
@@ -873,6 +1402,7 @@ export const POSProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
       : staffOrId;
     if (target) {
       setCurrentStaff(target);
+      localStorage.setItem(STORAGE_KEYS.STAFF_CURRENT, target.id);
       addActivityLog('สลับผู้ใช้งาน', `เปลี่ยนผู้ใช้เป็น ${target.name} (${target.role})`);
     }
   };
@@ -887,6 +1417,7 @@ export const POSProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
     };
     setStaffList((prev) => [...prev, newStaff]);
     addActivityLog('เพิ่มพนักงานใหม่', `เพิ่ม ${name} ในตำแหน่ง ${role}`);
+    setDoc(doc(db, 'staff', newStaff.id), newStaff).catch((e) => console.warn('Staff write error:', e));
     return newStaff;
   };
 
@@ -898,16 +1429,22 @@ export const POSProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
       setCurrentStaff((prev) => ({ ...prev, ...updates }));
     }
     addActivityLog('แก้ไขข้อมูลพนักงาน', `แก้ไขพนักงาน ID: ${id}`);
+    updateDoc(doc(db, 'staff', id), updates).catch((e) => console.warn('Staff update error:', e));
   };
 
   const deleteStaff = (id: string) => {
     setStaffList((prev) => prev.filter((s) => s.id !== id));
     addActivityLog('ลบพนักงาน', `ลบพนักงาน ID: ${id}`);
+    deleteDoc(doc(db, 'staff', id)).catch((e) => console.warn('Staff delete error:', e));
   };
 
   const updateSettings = (newSettings: Partial<StoreSettings>) => {
-    setSettings((prev) => ({ ...prev, ...newSettings }));
+    const updated = { ...settings, ...newSettings };
+    setSettings(updated);
     addActivityLog('แก้ไขการตั้งค่าร้านค้า', 'ปรับปรุงข้อมูลร้านค้าหรือระบบเงินทอน');
+    setDoc(doc(db, 'settings', 'store_config'), updated, { merge: true }).catch((e) =>
+      console.warn('Settings write error:', e)
+    );
   };
 
   return (
@@ -928,6 +1465,11 @@ export const POSProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
         activityLogs,
         todayDateStr,
         isTodayClosed,
+
+        isOnline,
+        syncStatus,
+        lastSyncedAt,
+        syncError,
 
         addToCart,
         updateCartItemQuantity,

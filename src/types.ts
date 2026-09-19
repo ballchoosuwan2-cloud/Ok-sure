@@ -13,15 +13,26 @@ export interface Product {
   sku: string;
   barcode: string;
   name: string;
+  product_name?: string;
   category: string;
   costPrice: number;
+  cost_price?: number;
   sellingPrice: number;
+  selling_price?: number;
   stock: number;
   unit: string;
   minStock: number;
+  min_stock?: number;
   image?: string;
+  image_url?: string;
   description?: string;
+  minProfit?: number;
+  minimum_profit?: number;
+  minProfitType?: 'amount' | 'percent';
+  createdAt?: string;
+  created_at?: string;
   updatedAt?: string;
+  updated_at?: string;
 }
 
 export interface CartItem {
@@ -123,18 +134,24 @@ export interface DailyClosingRecord {
   cardSales: number;
   totalCash?: number;
   totalPromptPay?: number;
+  totalCard?: number;
   totalDiscount: number;
   totalRefunds: number;
   totalCost: number;
   grossProfit: number;
   startingCash: number;
+  openingCash?: number;
   expectedCash: number;
+  expectedCashInDrawer?: number;
   actualCash: number;
   actualCashCounted?: number;
   cashDifference: number; // actual - expected (positive = surplus, negative = shortage)
   notes: string;
   isLocked: boolean;
+  timestamp?: string;
 }
+
+export type DailyClosing = DailyClosingRecord;
 
 export interface ActivityLog {
   id: string;

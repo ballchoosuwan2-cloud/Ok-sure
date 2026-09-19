@@ -128,13 +128,13 @@ export const PosView: React.FC = () => {
   const totalItemCount = cart.reduce((sum, item) => sum + item.quantity, 0);
 
   // Checkout confirmation
-  const handleConfirmPayment = (
+  const handleConfirmPayment = async (
     method: PaymentMethod,
     cashReceived?: number,
     splitDetails?: SplitPaymentDetail,
     customerName?: string
   ) => {
-    const result = processCheckout(method, cashReceived, splitDetails, customerName);
+    const result = await processCheckout(method, cashReceived, splitDetails, customerName);
     setIsCheckoutOpen(false);
     setLastCompletedTx(result.transaction);
     setIsReceiptOpen(true);

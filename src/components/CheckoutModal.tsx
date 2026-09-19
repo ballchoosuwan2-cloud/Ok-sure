@@ -12,6 +12,7 @@ import {
   AlertCircle,
   Clock,
   ArrowRight,
+  RefreshCw,
 } from 'lucide-react';
 
 interface CheckoutModalProps {
@@ -24,7 +25,7 @@ interface CheckoutModalProps {
     cashReceived?: number,
     splitDetails?: SplitPaymentDetail,
     customerName?: string
-  ) => void;
+  ) => Promise<void> | void;
 }
 
 export const CheckoutModal: React.FC<CheckoutModalProps> = ({
@@ -38,6 +39,8 @@ export const CheckoutModal: React.FC<CheckoutModalProps> = ({
   const [cashReceived, setCashReceived] = useState<number>(grandTotal);
   const [customerName, setCustomerName] = useState<string>('');
   const [promptPayQrUrl, setPromptPayQrUrl] = useState<string>('');
+  const [isSubmitting, setIsSubmitting] = useState(false);
+  const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [splitDetails, setSplitDetails] = useState<SplitPaymentDetail>({
     cash: 0,
     promptpay: 0,
@@ -74,6 +77,8 @@ export const CheckoutModal: React.FC<CheckoutModalProps> = ({
     if (isOpen) {
       setCashReceived(grandTotal);
       setSplitDetails({ cash: grandTotal, promptpay: 0, card: 0 });
+      setErrorMessage(null);
+      setIsSubmitting(false);
     }
   }, [isOpen, grandTotal]);
 
@@ -87,19 +92,38 @@ export const CheckoutModal: React.FC<CheckoutModalProps> = ({
     setCashReceived((prev) => prev + addition);
   };
 
-  const handleSubmit = (e: React.FormEvent) => {
+  const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
+    if (isSubmitting) return;
 
-    if (method === 'cash') {
-      if (!isCashSufficient) return;
-      onConfirmPayment('cash', cashReceived, undefined, customerName);
-    } else if (method === 'promptpay') {
-      onConfirmPayment('promptpay', undefined, undefined, customerName);
-    } else if (method === 'card') {
-      onConfirmPayment('card', undefined, undefined, customerName);
-    } else if (method === 'split') {
-      if (Math.abs(splitRemaining) > 0.01) return;
-      onConfirmPayment('split', undefined, splitDetails, customerName);
+    setErrorMessage(null);
+    setIsSubmitting(true);
+
+    try {
+      if (method === 'cash') {
+        if (!isCashSufficient) {
+          setIsSubmitting(false);
+          return;
+        }
+        await onConfirmPayment('cash', cashReceived, undefined, customerName);
+      } else if (method === 'promptpay') {
+        await onConfirmPayment('promptpay', undefined, undefined, customerName);
+      } else if (method === 'card') {
+        await onConfirmPayment('card', undefined, undefined, customerName);
+      } else if (method === 'split') {
+        if (Math.abs(splitRemaining) > 0.01) {
+          setIsSubmitting(false);
+          return;
+        }
+        await onConfirmPayment('split', undefined, splitDetails, customerName);
+      }
+    } catch (err: any) {
+      console.error('Checkout processing error:', err);
+      setErrorMessage(
+        err.message || 'ไม่สามารถบันทึกข้อมูลได้ กรุณาตรวจสอบการเชื่อมต่ออินเทอร์เน็ต'
+      );
+    } finally {
+      setIsSubmitting(false);
     }
   };
 
@@ -143,6 +167,17 @@ export const CheckoutModal: React.FC<CheckoutModalProps> = ({
             />
           </div>
         </div>
+
+        {/* Real-time Cloud Error Banner */}
+        {errorMessage && (
+          <div className="mx-6 mt-4 p-3 bg-rose-50 border border-rose-200 text-rose-800 rounded-xl text-xs flex items-start gap-2.5 shadow-xs">
+            <AlertCircle className="w-4 h-4 text-rose-500 shrink-0 mt-0.5" />
+            <div className="flex-1">
+              <p className="font-bold text-rose-900">ไม่สามารถทำรายการได้</p>
+              <p className="text-rose-700 mt-0.5">{errorMessage}</p>
+            </div>
+          </div>
+        )}
 
         {/* Payment Methods Tabs */}
         <div className="grid grid-cols-4 p-2 bg-pink-50/50 border-b border-pink-100 gap-1.5">
@@ -433,18 +468,29 @@ export const CheckoutModal: React.FC<CheckoutModalProps> = ({
             <button
               type="submit"
               disabled={
+                isSubmitting ||
                 (method === 'cash' && !isCashSufficient) ||
                 (method === 'split' && Math.abs(splitRemaining) > 0.01)
               }
               className={`flex-2 py-3 px-6 text-white font-bold text-sm rounded-xl shadow-sm flex items-center justify-center gap-2 transition ${
+                isSubmitting ||
                 (method === 'cash' && !isCashSufficient) ||
                 (method === 'split' && Math.abs(splitRemaining) > 0.01)
                   ? 'bg-slate-300 cursor-not-allowed text-slate-500'
                   : 'bg-gradient-to-r from-pink-600 to-rose-600 hover:from-pink-500 hover:to-rose-500 active:from-pink-700 active:to-rose-700'
               }`}
             >
-              <span>ยืนยันการรับเงิน & ออกใบเสร็จ</span>
-              <ArrowRight className="w-4 h-4" />
+              {isSubmitting ? (
+                <>
+                  <RefreshCw className="w-4 h-4 animate-spin text-white" />
+                  <span>กำลังตรวจสอบสต็อกและบันทึกคลาวด์...</span>
+                </>
+              ) : (
+                <>
+                  <span>ยืนยันการรับเงิน & ออกใบเสร็จ</span>
+                  <ArrowRight className="w-4 h-4" />
+                </>
+              )}
             </button>
           </div>
         </form>

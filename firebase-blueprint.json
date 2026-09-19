@@ -1,0 +1,172 @@
+{
+  "entities": {
+    "Product": {
+      "title": "Product",
+      "description": "Store inventory product item with real-time stock and pricing",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "name": { "type": "string" },
+        "product_name": { "type": "string" },
+        "category": { "type": "string" },
+        "sku": { "type": "string" },
+        "barcode": { "type": "string" },
+        "costPrice": { "type": "number" },
+        "cost_price": { "type": "number" },
+        "sellingPrice": { "type": "number" },
+        "selling_price": { "type": "number" },
+        "stock": { "type": "number" },
+        "unit": { "type": "string" },
+        "minStock": { "type": "number" },
+        "min_stock": { "type": "number" },
+        "image": { "type": "string" },
+        "image_url": { "type": "string" },
+        "minProfit": { "type": "number" },
+        "minProfitType": { "type": "string" },
+        "createdAt": { "type": "string" },
+        "created_at": { "type": "string" },
+        "updatedAt": { "type": "string" },
+        "updated_at": { "type": "string" }
+      },
+      "required": ["id", "name", "category", "sellingPrice", "stock"]
+    },
+    "Transaction": {
+      "title": "Transaction",
+      "description": "Completed point of sale bill transaction",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "billNumber": { "type": "string" },
+        "timestamp": { "type": "string" },
+        "date": { "type": "string" },
+        "time": { "type": "string" },
+        "cashierId": { "type": "string" },
+        "cashierName": { "type": "string" },
+        "customerName": { "type": "string" },
+        "totalAmount": { "type": "number" },
+        "discountAmount": { "type": "number" },
+        "netTotal": { "type": "number" },
+        "paymentMethod": { "type": "string" },
+        "cashReceived": { "type": "number" },
+        "changeGiven": { "type": "number" },
+        "status": { "type": "string" }
+      },
+      "required": ["id", "billNumber", "netTotal", "paymentMethod", "status"]
+    },
+    "QueueItem": {
+      "title": "QueueItem",
+      "description": "Real-time queue calling ticket",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "queueNumber": { "type": "number" },
+        "dateStr": { "type": "string" },
+        "customerName": { "type": "string" },
+        "status": { "type": "string" },
+        "createdAt": { "type": "string" }
+      },
+      "required": ["id", "queueNumber", "status"]
+    },
+    "StockMovement": {
+      "title": "StockMovement",
+      "description": "Log of stock adjustments and sales deductions",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "productId": { "type": "string" },
+        "productName": { "type": "string" },
+        "type": { "type": "string" },
+        "quantity": { "type": "number" },
+        "previousStock": { "type": "number" },
+        "newStock": { "type": "number" },
+        "reason": { "type": "string" },
+        "staffName": { "type": "string" },
+        "timestamp": { "type": "string" }
+      },
+      "required": ["id", "productId", "type", "quantity", "newStock"]
+    },
+    "DailyClosing": {
+      "title": "DailyClosing",
+      "description": "Shift and daily register closing record",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "dateStr": { "type": "string" },
+        "closedAt": { "type": "string" },
+        "staffId": { "type": "string" },
+        "staffName": { "type": "string" },
+        "totalSales": { "type": "number" },
+        "totalBills": { "type": "number" },
+        "totalItemsSold": { "type": "number" },
+        "cashSales": { "type": "number" },
+        "promptpaySales": { "type": "number" },
+        "cardSales": { "type": "number" },
+        "startingCash": { "type": "number" },
+        "expectedCash": { "type": "number" },
+        "actualCash": { "type": "number" },
+        "cashDifference": { "type": "number" },
+        "notes": { "type": "string" },
+        "isLocked": { "type": "boolean" }
+      },
+      "required": ["id", "dateStr", "totalSales", "actualCash"]
+    },
+    "StoreSettings": {
+      "title": "StoreSettings",
+      "description": "Global store profile, branch details, and tax/receipt info",
+      "type": "object",
+      "properties": {
+        "storeName": { "type": "string" },
+        "storeBranch": { "type": "string" },
+        "storeAddress": { "type": "string" },
+        "storePhone": { "type": "string" },
+        "taxId": { "type": "string" },
+        "promptPayId": { "type": "string" },
+        "receiptFooterMessage": { "type": "string" }
+      },
+      "required": ["storeName"]
+    },
+    "HeldBill": {
+      "title": "HeldBill",
+      "description": "Shared suspended cart bill across terminals",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "name": { "type": "string" },
+        "overallDiscount": { "type": "number" },
+        "timestamp": { "type": "string" },
+        "cashierName": { "type": "string" }
+      },
+      "required": ["id", "name"]
+    }
+  },
+  "firestore": {
+    "/products/{productId}": {
+      "schema": { "$ref": "Product" },
+      "description": "Online central product catalog and real-time inventory"
+    },
+    "/transactions/{transactionId}": {
+      "schema": { "$ref": "Transaction" },
+      "description": "All customer orders and payment transactions"
+    },
+    "/queues/{queueId}": {
+      "schema": { "$ref": "QueueItem" },
+      "description": "Real-time order queue calling"
+    },
+    "/stockMovements/{movementId}": {
+      "schema": { "$ref": "StockMovement" },
+      "description": "Inventory movement audit log"
+    },
+    "/dailyClosings/{closingId}": {
+      "schema": { "$ref": "DailyClosing" },
+      "description": "End-of-day register closing summaries"
+    },
+    "/settings/{settingId}": {
+      "schema": { "$ref": "StoreSettings" },
+      "description": "Store configuration shared by all terminals"
+    },
+    "/heldBills/{billId}": {
+      "schema": { "$ref": "HeldBill" },
+      "description": "Shared held cart bills"
+    }
+  }
+}

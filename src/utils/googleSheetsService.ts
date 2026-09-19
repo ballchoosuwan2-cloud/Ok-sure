@@ -349,15 +349,15 @@ export const exportClosingsToSheets = async (
 
   const rows = closings.map((c) => [
     c.dateStr,
-    new Date(c.timestamp).toLocaleTimeString('th-TH'),
+    new Date(c.timestamp || c.closedAt || Date.now()).toLocaleTimeString('th-TH'),
     c.staffName,
     c.totalSales,
-    c.totalCash,
-    c.totalPromptPay,
-    c.totalCard,
-    c.openingCash,
-    c.expectedCashInDrawer,
-    c.actualCashCounted,
+    c.totalCash ?? c.cashSales ?? 0,
+    c.totalPromptPay ?? c.promptpaySales ?? 0,
+    c.totalCard ?? c.cardSales ?? 0,
+    c.openingCash ?? c.startingCash ?? 0,
+    c.expectedCashInDrawer ?? c.expectedCash ?? 0,
+    c.actualCashCounted ?? c.actualCash ?? 0,
     c.cashDifference,
     c.notes || '',
   ]);

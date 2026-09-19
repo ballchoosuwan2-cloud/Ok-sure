@@ -12,6 +12,9 @@ import {
   UserCheck,
   BookOpen,
   FileSpreadsheet,
+  Cloud,
+  CloudOff,
+  RefreshCw,
 } from 'lucide-react';
 
 interface NavbarProps {
@@ -21,7 +24,7 @@ interface NavbarProps {
 }
 
 export const Navbar: React.FC<NavbarProps> = ({ activeTab, onSelectTab, onOpenGoogleSheets }) => {
-  const { settings, currentStaff, cart, products, queues, isTodayClosed } = usePOS();
+  const { settings, currentStaff, cart, products, queues, isTodayClosed, isOnline, syncStatus } = usePOS();
 
   const cartCount = cart.reduce((s, i) => s + i.quantity, 0);
   const lowStockCount = products.filter((p) => p.stock <= p.minStock).length;
@@ -161,6 +164,39 @@ export const Navbar: React.FC<NavbarProps> = ({ activeTab, onSelectTab, onOpenGo
 
           {/* Right Staff & Status Badge */}
           <div className="flex items-center gap-2">
+            {/* Real-time Central Cloud Database Status */}
+            <div
+              className={`flex items-center gap-1.5 px-2.5 py-1 rounded-xl text-[11px] border transition ${
+                !isOnline || syncStatus === 'offline'
+                  ? 'bg-rose-500/25 border-rose-400/40 text-rose-100'
+                  : syncStatus === 'syncing'
+                  ? 'bg-amber-400/25 border-amber-300/40 text-amber-100'
+                  : 'bg-emerald-500/20 border-emerald-300/30 text-emerald-100'
+              }`}
+              title={
+                !isOnline || syncStatus === 'offline'
+                  ? 'ไม่มีการเชื่อมต่ออินเทอร์เน็ต ข้อมูลยังไม่ได้ซิงก์'
+                  : 'เชื่อมต่อฐานข้อมูลออนไลน์กลาง (Firestore) เรียบร้อย - ทุกเครื่องซิงก์ข้อมูลตรงกันแบบ Real-time'
+              }
+            >
+              {!isOnline || syncStatus === 'offline' ? (
+                <>
+                  <CloudOff className="w-3.5 h-3.5 text-rose-300" />
+                  <span className="hidden sm:inline font-bold">ออฟไลน์</span>
+                </>
+              ) : syncStatus === 'syncing' ? (
+                <>
+                  <RefreshCw className="w-3.5 h-3.5 text-amber-300 animate-spin" />
+                  <span className="hidden sm:inline font-bold">กำลังซิงก์</span>
+                </>
+              ) : (
+                <>
+                  <span className="w-2 h-2 rounded-full bg-emerald-300 animate-pulse" />
+                  <span className="hidden sm:inline font-bold">ฐานข้อมูลออนไลน์</span>
+                </>
+              )}
+            </div>
+
             {/* Google Sheets Sync Trigger */}
             {onOpenGoogleSheets && (
               <button
